@@ -6,10 +6,7 @@ use anyhow::{Context, Result};
 use std::{
     path::Path,
     process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::Ordering,
     time::Duration,
 };
 
@@ -38,13 +35,17 @@ impl Backend for WlrBackend {
     }
 
     fn record(&self, region: Option<&Region>, output: &Path, config: &RecordConfig) -> Result<()> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop);
+        super::reset_ctrl_c();
+        super::ensure_ctrl_c_handler()?;
 
-        ctrlc::set_handler(move || {
-            stop_clone.store(true, Ordering::SeqCst);
-        })
-        .context("failed to set signal handler")?;
+        // Stop can be requested via Ctrl-C or externally (GUI stop button).
+        let stopped = || {
+            super::ctrl_c_pressed()
+                || config
+                    .stop
+                    .as_ref()
+                    .is_some_and(|s| s.load(Ordering::SeqCst))
+        };
 
         if !config.quiet {
             output::recording(config.duration);
@@ -59,7 +60,8 @@ impl Backend for WlrBackend {
         cmd.args(["-r", &config.fps.to_string()])
             .args(["-c", "libx264rgb"])
             .args(["-p", "crf=18"])
-            .args(["-f", output.to_str().unwrap()])
+            .arg("-f")
+            .arg(output)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -68,13 +70,15 @@ impl Backend for WlrBackend {
 
         let poll = Duration::from_millis(50);
         let max_iters = if config.duration > 0.0 {
-            ((config.duration * 1000.0) / poll.as_millis() as f32) as u64
+            // At least one iteration so a very short duration doesn't signal
+            // wf-recorder before it has started capturing.
+            (((config.duration * 1000.0) / poll.as_millis() as f32) as u64).max(1)
         } else {
             u64::MAX
         };
 
         for _ in 0..max_iters {
-            if stop.load(Ordering::SeqCst) {
+            if stopped() {
                 break;
             }
             if let Ok(Some(status)) = child.try_wait() {
@@ -95,7 +99,7 @@ impl Backend for WlrBackend {
         let status = child.wait().context("failed to wait for wf-recorder")?;
 
         // SIGINT causes non-zero exit, which is expected
-        if !status.success() && !stop.load(Ordering::SeqCst) && config.duration <= 0.0 {
+        if !status.success() && !stopped() && config.duration <= 0.0 {
             return Err(Error::Recording(format!("unexpected exit: {}", status)).into());
         }
 

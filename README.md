@@ -60,6 +60,16 @@ cargo install --path .
 
 This will build and install `wlgif` in your `~/.cargo/bin`. Make sure that `~/.cargo/bin` is in your `$PATH` variable.
 
+### GUI (optional)
+
+An optional graphical frontend is available behind the `gui` feature:
+
+```sh
+cargo install --path . --features gui
+```
+
+Run it with `wlgif --gui`. It provides a drag-to-select region overlay, sliders for fps/duration/scale, backend selection, a recording progress bar, and an animated preview of the resulting GIF. It reuses the same backend/converter modules as the CLI. CJK system fonts are picked up automatically so Chinese text renders.
+
 ### Dependencies
 
 #### XDG Desktop Portal Backend

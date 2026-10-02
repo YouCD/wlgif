@@ -6,11 +6,11 @@ use crate::region::Region;
 use anyhow::{Context, Result};
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+use gstreamer::MessageView;
 use gstreamer::prelude::*;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 pub struct XDGPortalBackend;
 
@@ -65,7 +65,7 @@ impl Backend for XDGPortalBackend {
 
 async fn record_async(output: &Path, config: &RecordConfig) -> Result<()> {
     if !config.quiet {
-        output::status("Requesting screen capture via portal...");
+        output::status("Requesting screen capture via portal");
     }
 
     // Create screencast session
@@ -135,13 +135,17 @@ fn record_gstreamer(
 ) -> Result<()> {
     gstreamer::init().context("failed to initialize GStreamer")?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = Arc::clone(&stop);
+    super::reset_ctrl_c();
+    super::ensure_ctrl_c_handler()?;
 
-    ctrlc::set_handler(move || {
-        stop_clone.store(true, Ordering::SeqCst);
-    })
-    .context("failed to set signal handler")?;
+    // Stop can be requested via Ctrl-C or externally (GUI stop button).
+    let stopped = || {
+        super::ctrl_c_pressed()
+            || config
+                .stop
+                .as_ref()
+                .is_some_and(|s| s.load(Ordering::SeqCst))
+    };
 
     if !config.quiet {
         output::recording(config.duration);
@@ -175,19 +179,22 @@ fn record_gstreamer(
     let bus = pipeline.bus().context("pipeline has no bus")?;
     let poll = std::time::Duration::from_millis(50);
     let max_iters = if config.duration > 0.0 {
-        ((config.duration * 1000.0) / poll.as_millis() as f32) as u64
+        // At least one iteration so a very short duration doesn't stop the
+        // pipeline before it has produced any data.
+        (((config.duration * 1000.0) / poll.as_millis() as f32) as u64).max(1)
     } else {
         u64::MAX
     };
 
+    let mut eos_seen = false;
+
     for _ in 0..max_iters {
-        if stop.load(Ordering::SeqCst) {
+        if stopped() {
             break;
         }
 
         // Check for pipeline errors
         if let Some(msg) = bus.timed_pop(gstreamer::ClockTime::from_mseconds(50)) {
-            use gstreamer::MessageView;
             match msg.view() {
                 MessageView::Error(err) => {
                     pipeline.set_state(gstreamer::State::Null).ok();
@@ -195,27 +202,44 @@ fn record_gstreamer(
                         Error::Recording(format!("GStreamer error: {}", err.error())).into(),
                     );
                 }
-                MessageView::Eos(_) => break,
+                MessageView::Eos(_) => {
+                    eos_seen = true;
+                    break;
+                }
                 _ => {}
             }
         }
     }
 
-    // Graceful shutdown: send EOS and wait for it to propagate
-    pipeline.send_event(gstreamer::event::Eos::new());
+    // Graceful shutdown: send EOS and wait for it to propagate.
+    // Skip this entirely if the pipeline already reached EOS (e.g. the
+    // portal stream ended), which would otherwise waste a 5s timeout.
+    if !eos_seen {
+        pipeline.send_event(gstreamer::event::Eos::new());
 
-    // Wait for EOS to be processed (max 5 seconds)
-    for _ in 0..100 {
-        if let Some(msg) = bus.timed_pop(gstreamer::ClockTime::from_mseconds(50))
-            && let gstreamer::MessageView::Eos(_) = msg.view()
-        {
-            break;
+        // Wait for EOS to be processed (max 5 seconds)
+        for _ in 0..100 {
+            if let Some(msg) = bus.timed_pop(gstreamer::ClockTime::from_mseconds(50))
+                && let MessageView::Eos(_) = msg.view()
+            {
+                break;
+            }
         }
     }
 
     pipeline
         .set_state(gstreamer::State::Null)
         .context("failed to stop pipeline")?;
+
+    // set_state only schedules the transition; wait for it to complete so
+    // mp4mux can finalize the file (write the moov atom).
+    let stop_timeout = gstreamer::ClockTime::from_mseconds(5000);
+    let (result, _, _) = pipeline.state(stop_timeout);
+    if let Err(err) = result {
+        return Err(anyhow::anyhow!(
+            "failed to stop GStreamer pipeline: {err:?}"
+        ));
+    }
 
     Ok(())
 }

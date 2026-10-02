@@ -28,3 +28,4 @@ result-*
 .direnv
 
 wlgif-test-vm.qcow2
+output.gif

@@ -102,7 +102,7 @@ impl std::fmt::Display for Region {
 /// Interactive region selection using slurp.
 pub fn select_interactive(quiet: bool) -> Result<Region> {
     if !quiet {
-        output::status("Select a region...");
+        output::status("Select a region");
     }
 
     let result = Command::new("slurp")
