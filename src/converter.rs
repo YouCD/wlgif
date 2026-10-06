@@ -1,6 +1,8 @@
+use crate::backend::ffmpeg;
 use crate::error::Error;
 use crate::output;
 use anyhow::{Context, Result};
+use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -40,11 +42,57 @@ pub fn to_gif(
     Ok(())
 }
 
+/// Re-encode a captured video into a broadly playable H.264 file.
+///
+/// The native backend records with `libx264rgb` so the palette pass sees the
+/// compositor's exact pixels; the price is an MP4 carrying planar RGB
+/// (`gbrp`), which browsers and hardware decoders refuse. A video the user
+/// asked to keep goes through `libx264`/`yuv420p` instead. Without that
+/// encoder the original file is copied unchanged — a lossless file that
+/// plays nowhere beats no file at all.
+pub fn to_h264_video(input: &Path, output: &Path, quiet: bool) -> Result<()> {
+    if !ffmpeg::available_encoders()?.contains("libx264") {
+        fs::copy(input, output).with_context(|| format!("failed to save {}", output.display()))?;
+        return Ok(());
+    }
+
+    if !quiet {
+        output::status("Re-encoding video for player compatibility");
+    }
+
+    let log = tempfile::NamedTempFile::new().context("failed to create ffmpeg log file")?;
+    let status = ffmpeg::ffmpeg()
+        .arg("-i")
+        .arg(input)
+        // HiDPI captures can be odd-sized (500x375 at 1.25x scaling) and
+        // libx264 rejects odd dimensions; pass-through when already even.
+        .args(["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"])
+        .args([
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-preset", "veryfast", "-an",
+        ])
+        .arg(output)
+        .stderr(Stdio::from(ffmpeg::log_file(log.path())?))
+        .status()
+        .context("failed to run ffmpeg")?;
+
+    if !status.success() {
+        return Err(ffmpeg::failed(&status, log.path()));
+    }
+    Ok(())
+}
+
 /// Estimated number of output frames: input duration × output fps. `None` if
 /// the input duration can't be determined (no progress reporting then).
 fn probe_total_frames(input: &Path, fps: u32) -> Option<u64> {
     let out = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+        ])
         .arg(input)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -82,7 +130,9 @@ fn run_ffmpeg(
     let mut line = String::new();
     while reader.read_line(&mut line)? > 0 {
         line.truncate(line.trim_end_matches(['\r', '\n']).len());
-        if let Some(n) = line.strip_prefix("frame=") && let Ok(f) = n.parse::<u64>() {
+        if let Some(n) = line.strip_prefix("frame=")
+            && let Ok(f) = n.parse::<u64>()
+        {
             report(if total_frames > 0 {
                 (f as f64 / total_frames as f64).min(1.0)
             } else {

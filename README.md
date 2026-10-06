@@ -181,6 +181,18 @@ Dependencies:
 
 The two-pass encoding is why `wlgif` produces smaller, better-looking GIFs than naive single-pass conversion.
 
+## Limitations
+
+- **One output per recording.** A region that spills past the edge of the
+  monitor it starts on is rejected with a message naming the outputs — not
+  silently clipped. Pick a region inside a single monitor.
+- **ffmpeg needs a video encoder.** The native backend prefers `libx264rgb`
+  (exact pixels, best GIF palette) and falls back to `libx264`, then `mpeg4`.
+  If none exist you get an error before recording starts, not after it.
+- **Kept videos are re-encoded.** The raw recording is planar RGB (`gbrp`),
+  which browsers and hardware decoders reject. `--keep-video` and the GUI's
+  video mode re-encode to `h264`/`yuv420p`; the GIF path is unaffected.
+
 ## Acknowledgements
 
 - [Ghostty](https://github.com/ghostty-org/ghostty/blob/main/HACKING.md#nix-virtual-machines) for inspiration on NixOS VM testing infrastructure

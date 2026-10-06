@@ -109,7 +109,7 @@ fn main() -> Result<()> {
 
     if args.keep_video {
         let kept = args.output.with_extension("mp4");
-        fs::copy(&video, &kept).context("failed to save video")?;
+        converter::to_h264_video(&video, &kept, args.quiet)?;
         if !args.quiet {
             output::info(&format!("Video: {}", kept.display()));
         }

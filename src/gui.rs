@@ -34,6 +34,10 @@ use wayland_client::protocol::wl_output::WlOutput;
 /// Minimum drag size (px) before a selection is accepted.
 const MIN_DRAG: f32 = 8.0;
 
+/// Decoded animation for the in-app preview: RGBA frames as
+/// `(width, height, pixels)` plus the per-frame delay in seconds.
+type PreviewFrames = (Vec<(u32, u32, Vec<u8>)>, Vec<f32>);
+
 pub fn run(output_default: &Path) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -189,14 +193,14 @@ impl WlgifApp {
     }
 
     /// Decode a PNG into a single preview frame.
-    fn decode_png_preview(bytes: &[u8]) -> Option<(Vec<(u32, u32, Vec<u8>)>, Vec<f32>)> {
+    fn decode_png_preview(bytes: &[u8]) -> Option<PreviewFrames> {
         let (w, h, rgba) = decode_png_rgba(bytes.to_vec()).ok()?;
         Some((vec![(w as u32, h as u32, rgba)], vec![f32::MAX]))
     }
 
     /// Decode a GIF into raw RGBA frames with their delays (seconds), for the
     /// in-app preview. Returns `None` if the file is not a decodable GIF.
-    fn decode_gif_preview(bytes: &[u8]) -> Option<(Vec<(u32, u32, Vec<u8>)>, Vec<f32>)> {
+    fn decode_gif_preview(bytes: &[u8]) -> Option<PreviewFrames> {
         use image::AnimationDecoder;
         let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
         let frames = decoder.into_frames().collect_frames().ok()?;
@@ -209,7 +213,11 @@ impl WlgifApp {
             let (num, den) = frame.delay().numer_denom_ms();
             // A delay of 0 is undefined per the GIF spec; 100 ms is the
             // conventional default most decoders use.
-            let ms = if num == 0 { 10.0 } else { num as f32 / den.max(1) as f32 };
+            let ms = if num == 0 {
+                10.0
+            } else {
+                num as f32 / den.max(1) as f32
+            };
             delays.push(ms / 1000.0);
             let buf = frame.buffer();
             out.push((buf.width(), buf.height(), buf.as_raw().clone()));
@@ -274,11 +282,11 @@ impl WlgifApp {
         slider: egui::Slider<'_>,
     ) -> egui::Response {
         let size = egui::vec2(width, ui.spacing().interact_size.y);
-        ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |
-            inner,
-        | {
-            inner.add_enabled(enabled, slider)
-        })
+        ui.allocate_ui_with_layout(
+            size,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |inner| inner.add_enabled(enabled, slider),
+        )
         .inner
     }
 
@@ -325,7 +333,9 @@ impl WlgifApp {
             if let (Some(a), Some(b)) = (self.drag_start, self.drag_cur) {
                 self.finish_selection(
                     Rect::from_two_pos(a, b),
-                    ui.ctx().input(|i| i.raw.screen_rect).unwrap_or(ui.max_rect()),
+                    ui.ctx()
+                        .input(|i| i.raw.screen_rect)
+                        .unwrap_or(ui.max_rect()),
                 );
             }
             self.selecting = false;
@@ -343,7 +353,10 @@ impl WlgifApp {
         // full window rect rather than this panel's: egui's CentralPanel
         // insets its content by a margin, and we want the screenshot to
         // cover every pixel.
-        let screen = ui.ctx().input(|i| i.raw.screen_rect).unwrap_or(ui.max_rect());
+        let screen = ui
+            .ctx()
+            .input(|i| i.raw.screen_rect)
+            .unwrap_or(ui.max_rect());
 
         // Screenshot background, uploaded once as a texture. The handle is
         // stored in the struct: egui frees a texture when the last
@@ -351,11 +364,9 @@ impl WlgifApp {
         if let Some((w, h, rgba)) = &self.screenshot_rgba {
             if self.overlay_texture.is_none() {
                 let color_image = ColorImage::from_rgba_unmultiplied([*w, *h], rgba);
-                let handle = ui.ctx().load_texture(
-                    "wlgif-overlay",
-                    color_image,
-                    TextureOptions::default(),
-                );
+                let handle =
+                    ui.ctx()
+                        .load_texture("wlgif-overlay", color_image, TextureOptions::default());
                 self.overlay_texture = Some(handle);
             }
             if let Some(handle) = &self.overlay_texture {
@@ -426,9 +437,8 @@ impl WlgifApp {
                 ui.add(bar);
             }
             Phase::Converting => {
-                let mut bar =
-                    egui::ProgressBar::new((job.progress).clamp(0.0, 1.0) as f32)
-                        .text("转换为 GIF…");
+                let mut bar = egui::ProgressBar::new((job.progress).clamp(0.0, 1.0) as f32)
+                    .text("转换为 GIF…");
                 // No frame count available (ffprobe failed): fall back to an
                 // indeterminate animated bar.
                 if job.progress <= 0.0 {
@@ -576,8 +586,7 @@ impl eframe::App for WlgifApp {
                         && ext != self.mode.ext()
                         && let Some(stem) = p.file_stem()
                     {
-                        self.output =
-                            format!("{}.{}", stem.to_string_lossy(), self.mode.ext());
+                        self.output = format!("{}.{}", stem.to_string_lossy(), self.mode.ext());
                     }
                 }
             });
@@ -1050,11 +1059,9 @@ fn record_and_convert(
     }
 
     if params.mode == Mode::Video {
-        // No conversion: move the captured video to the output path (only on
-        // success, so a failed run doesn't clobber the last good file).
-        if fs::rename(&video, &params.output).is_err() {
-            fs::copy(&video, &params.output).context("failed to save video")?;
-        }
+        // The capture is planar-RGB H.264 (exact pixels for the palette
+        // pass); the saved file is re-encoded to yuv420p so players accept it.
+        converter::to_h264_video(&video, &params.output, true).context("failed to save video")?;
         return Ok(());
     }
 
@@ -1089,40 +1096,15 @@ fn capture_and_save(params: &CaptureJob) -> Result<()> {
     }
 
     // Output-local logical coordinates of the capture region.
-    let (output, (x, y, w, h)) = match &params.region {
-        Some(r) => {
-            let (rx, ry) = (r.x as i32, r.y as i32);
-            let (o, info) = outputs
-                .iter()
-                .find(|(_, i)| {
-                    let (ox, oy) = (i.x, i.y);
-                    let (ow, oh) = (i.width as i32, i.height as i32);
-                    rx >= ox && ry >= oy && rx < ox + ow && ry < oy + oh
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("region ({}, {}) is outside every known output", r.x, r.y)
-                })?;
-            let (ox, oy) = (info.x, info.y);
-            let (ow, oh) = (info.width as i32, info.height as i32);
-            let x = rx - ox;
-            let y = ry - oy;
-            let w = (r.width as i32).min(ow - x).max(1);
-            let h = (r.height as i32).min(oh - y).max(1);
-            (o, (x, y, w, h))
-        }
-        None => {
-            let (o, info) = &outputs[0];
-            (o.clone(), (0, 0, info.width as i32, info.height as i32))
-        }
-    };
+    let (output, (x, y, w, h)) = screenshot::pick_output(outputs, params.region.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let cap = caps
         .capture_output_region(&output, x, y, w, h, true)
         .map_err(|e| anyhow::anyhow!("screenshot failed: {e}"))?;
     let rgba = screenshot::to_rgba8(&cap).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let img = image::RgbaImage::from_raw(cap.width, cap.height, rgba)
-        .context("failed to build image")?;
+    let img =
+        image::RgbaImage::from_raw(cap.width, cap.height, rgba).context("failed to build image")?;
     img.save(&params.output)
         .with_context(|| format!("failed to write {}", params.output.display()))?;
     Ok(())
@@ -1137,10 +1119,13 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut enc = image::codecs::gif::GifEncoder::new(&mut buf);
-            enc.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
-            for (i, c) in [[255u8, 0, 0], [0, 255, 0], [0, 0, 255]].into_iter().enumerate() {
-                let img =
-                    image::RgbaImage::from_pixel(4, 3, image::Rgba([c[0], c[1], c[2], 255]));
+            enc.set_repeat(image::codecs::gif::Repeat::Infinite)
+                .unwrap();
+            for (i, c) in [[255u8, 0, 0], [0, 255, 0], [0, 0, 255]]
+                .into_iter()
+                .enumerate()
+            {
+                let img = image::RgbaImage::from_pixel(4, 3, image::Rgba([c[0], c[1], c[2], 255]));
                 let delay = image::Delay::from_numer_denom_ms(50 + i as u32 * 10, 1);
                 enc.encode_frame(image::Frame::from_parts(img, 0, 0, delay))
                     .unwrap();

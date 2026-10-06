@@ -5,6 +5,7 @@
 //! (Sway, Hyprland, niri, dwl, ...). Compositors that don't implement the
 //! protocol (GNOME, KDE) are handled by the `grim` fallback in [`crate::gui`].
 
+use crate::region::Region;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::io::{AsFd, FromRawFd};
@@ -320,6 +321,100 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
     }
 }
 
+/// Output-local rect in pixels: `(x, y, width, height)`.
+pub type LocalRect = (i32, i32, i32, i32);
+
+/// Pure geometry behind [`pick_output`]: find the output a region lives on
+/// and return its index plus the output-local rect.
+///
+/// A capture covers exactly one output, so a region that spills past that
+/// output's edges is an error rather than a silent clip — the compositor
+/// would only ever deliver the part inside the output.
+fn resolve_region(outputs: &[OutputInfo], region: &Region) -> Result<(usize, LocalRect), String> {
+    let (rx, ry) = (region.x as i32, region.y as i32);
+    let (right, bottom) = (rx + region.width as i32, ry + region.height as i32);
+
+    // Indices of the outputs the region overlaps, in compositor order.
+    let touched: Vec<usize> = outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| {
+            rx < i.x + i.width as i32 && right > i.x && ry < i.y + i.height as i32 && bottom > i.y
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    let Some(&idx) = touched.first() else {
+        return Err(format!(
+            "region ({}, {}) is outside every known output",
+            region.x, region.y
+        ));
+    };
+
+    let info = &outputs[idx];
+    let (ox, oy) = (info.x, info.y);
+    let (ow, oh) = (info.width as i32, info.height as i32);
+
+    if right > ox + ow || bottom > oy + oh {
+        let names: Vec<String> = touched
+            .iter()
+            .map(|&i| {
+                outputs[i]
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "<unnamed>".to_owned())
+            })
+            .collect();
+        let span = if touched.len() == 1 {
+            format!(
+                "region {}x{}+{}+{} extends past the edge of output {}",
+                region.width, region.height, region.x, region.y, names[0]
+            )
+        } else {
+            format!(
+                "region {}x{}+{}+{} spans {} outputs ({})",
+                region.width,
+                region.height,
+                region.x,
+                region.y,
+                touched.len(),
+                names.join(", ")
+            )
+        };
+        return Err(format!(
+            "{span}\n  a recording covers a single output — pick a region inside one monitor"
+        ));
+    }
+
+    Ok((
+        idx,
+        (rx - ox, ry - oy, region.width as i32, region.height as i32),
+    ))
+}
+
+/// Pick the output a region lives on and convert the global logical region
+/// into output-local coordinates. Without a region, the first output.
+pub fn pick_output(
+    outputs: &[(WlOutput, OutputInfo)],
+    region: Option<&Region>,
+) -> Result<(WlOutput, LocalRect), String> {
+    if outputs.is_empty() {
+        return Err("compositor reports no outputs".to_owned());
+    }
+
+    let Some(region) = region else {
+        let (output, info) = &outputs[0];
+        return Ok((
+            output.clone(),
+            (0, 0, info.width as i32, info.height as i32),
+        ));
+    };
+
+    let infos: Vec<OutputInfo> = outputs.iter().map(|(_, i)| i.clone()).collect();
+    let (idx, rect) = resolve_region(&infos, region)?;
+    Ok((outputs[idx].0.clone(), rect))
+}
+
 /// A live screencopy session.
 pub struct Capture {
     queue: EventQueue<State>,
@@ -538,5 +633,70 @@ mod tests {
             pixels: vec![1, 2, 3],
         };
         assert!(to_rgba8(&cap).is_err());
+    }
+
+    fn out(name: &str, x: i32, y: i32, width: u32, height: u32) -> OutputInfo {
+        OutputInfo {
+            name: Some(name.to_owned()),
+            x,
+            y,
+            width,
+            height,
+            scale: 1,
+        }
+    }
+
+    fn region(x: u32, y: u32, width: u32, height: u32) -> Region {
+        Region {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn region_inside_one_output_is_localized() {
+        let outputs = [out("eDP-1", 0, 0, 1920, 1080)];
+        let (idx, (x, y, w, h)) = resolve_region(&outputs, &region(800, 100, 400, 300)).unwrap();
+        assert_eq!((idx, x, y, w, h), (0, 800, 100, 400, 300));
+    }
+
+    #[test]
+    fn region_on_the_second_output_uses_its_origin() {
+        let outputs = [
+            out("eDP-1", 0, 0, 1920, 1080),
+            out("DP-1", 1920, 0, 2560, 1440),
+        ];
+        let (idx, (x, y, w, h)) = resolve_region(&outputs, &region(2000, 200, 640, 480)).unwrap();
+        assert_eq!((idx, x, y, w, h), (1, 80, 200, 640, 480));
+    }
+
+    #[test]
+    fn region_spilling_past_the_output_is_reported_not_clipped() {
+        let outputs = [out("eDP-1", 0, 0, 1920, 1080)];
+        let err = resolve_region(&outputs, &region(1600, 100, 400, 300)).unwrap_err();
+        assert!(
+            err.contains("extends past the edge of output eDP-1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn region_spanning_two_outputs_names_both() {
+        let outputs = [
+            out("eDP-1", 0, 0, 1920, 1080),
+            out("DP-1", 1920, 0, 2560, 1440),
+        ];
+        let err = resolve_region(&outputs, &region(800, 100, 2400, 600)).unwrap_err();
+        assert!(err.contains("spans 2 outputs"), "{err}");
+        assert!(err.contains("eDP-1, DP-1"), "{err}");
+    }
+
+    #[test]
+    fn region_outside_every_output_is_reported() {
+        let outputs = [out("eDP-1", 0, 0, 1920, 1080)];
+        let err = resolve_region(&outputs, &region(3000, 2000, 100, 100)).unwrap_err();
+        assert!(err.contains("outside every known output"), "{err}");
     }
 }
